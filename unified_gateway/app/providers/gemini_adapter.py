@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import base64
+import json
+import time
+from typing import Any, AsyncIterator, Dict, List
+from uuid import uuid4
 
 from modules.gemini_proxy.api.app.config import (  # type: ignore
     AdminSection,
@@ -13,36 +17,90 @@ from modules.gemini_proxy.api.app.config import (  # type: ignore
 from modules.gemini_proxy.api.app.services import GeminiProxyService  # type: ignore
 
 from ..config import GeminiProviderConfig
-from .base import ProviderAdapter, ProviderResult
+from .base import ProviderAdapter, ProviderResult, ProviderStreamResult
 
 
-def _as_text(content: Any) -> str:
+def _data_url_to_inline_data(url: str) -> Dict[str, Any] | None:
+    value = str(url or "").strip()
+    if not value.startswith("data:") or "," not in value:
+        return None
+    header, encoded = value.split(",", 1)
+    if ";base64" not in header:
+        return None
+    mime_type = header[5:].split(";")[0].strip() or "application/octet-stream"
+    try:
+        base64.b64decode(encoded, validate=True)
+    except Exception:  # noqa: BLE001
+        return None
+    return {"inlineData": {"mimeType": mime_type, "data": encoded}}
+
+
+def _openai_content_to_gemini_parts(content: Any) -> List[Dict[str, Any]]:
+    parts: List[Dict[str, Any]] = []
     if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        out: List[str] = []
-        for item in content:
-            if isinstance(item, str):
-                out.append(item)
-                continue
-            if isinstance(item, dict) and item.get("type") == "text":
-                out.append(str(item.get("text", "")))
-        return "\n".join([x for x in out if x])
+        text = content.strip()
+        if text:
+            parts.append({"text": text})
+        return parts
+
     if isinstance(content, dict):
-        if content.get("type") == "text":
-            return str(content.get("text", ""))
-    return str(content or "")
+        content = [content]
+    if not isinstance(content, list):
+        text = str(content or "").strip()
+        if text:
+            parts.append({"text": text})
+        return parts
+
+    for item in content:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                parts.append({"text": text})
+            continue
+        if not isinstance(item, dict):
+            text = str(item or "").strip()
+            if text:
+                parts.append({"text": text})
+            continue
+
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type in {"text", "input_text"}:
+            text = str(item.get("text") or "").strip()
+            if text:
+                parts.append({"text": text})
+            continue
+
+        if item_type in {"image_url", "input_image"}:
+            image_value = item.get("image_url")
+            if isinstance(image_value, dict):
+                image_value = image_value.get("url")
+            if not image_value:
+                image_value = item.get("url")
+            if not image_value:
+                continue
+            inline_part = _data_url_to_inline_data(str(image_value))
+            if inline_part is not None:
+                parts.append(inline_part)
+            else:
+                # Keep non-data URL images as fileData when available.
+                parts.append({"fileData": {"fileUri": str(image_value)}})
+            continue
+
+        text = str(item.get("text") or "").strip()
+        if text:
+            parts.append({"text": text})
+    return parts
 
 
 def _openai_messages_to_gemini_contents(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     contents: List[Dict[str, Any]] = []
     for m in messages:
         role = str(m.get("role") or "user")
-        text = _as_text(m.get("content"))
-        if not text.strip():
+        parts = _openai_content_to_gemini_parts(m.get("content"))
+        if not parts:
             continue
         mapped_role = "model" if role == "assistant" else "user"
-        contents.append({"role": mapped_role, "parts": [{"text": text}]})
+        contents.append({"role": mapped_role, "parts": parts})
     return contents or [{"role": "user", "parts": [{"text": ""}]}]
 
 
@@ -125,6 +183,230 @@ class GeminiAdapter(ProviderAdapter):
                 model=model_name,
                 error=str(exc),
             )
+
+    async def chat_completions_stream(
+        self,
+        payload: Dict[str, Any],
+        model: str | None = None,
+        *,
+        timeout_sec: float | None = None,
+    ) -> ProviderStreamResult:
+        start = self.started()
+        model_name = str(model or payload.get("model") or self.default_model)
+        body: Dict[str, Any] = {"model": model_name}
+        if "contents" in payload:
+            body["contents"] = payload["contents"]
+        else:
+            body["contents"] = _openai_messages_to_gemini_contents(list(payload.get("messages") or []))
+
+        generation_config: Dict[str, Any] = {}
+        if "temperature" in payload:
+            generation_config["temperature"] = payload["temperature"]
+        if "max_tokens" in payload:
+            generation_config["maxOutputTokens"] = payload["max_tokens"]
+        if generation_config:
+            body["generationConfig"] = generation_config
+
+        api_version = str(self.service.settings.gemini.api_version)
+        method = "streamGenerateContent"
+        params = {"alt": "sse"}
+
+        retries = max(0, int(self.service.settings.proxy.max_retries_per_key) - 1)
+        for _ in range(retries + 1):
+            await self.service.limiter.wait()
+            active_worker_slot = None
+            active_worker_url = None
+            active_key_slot = None
+            active_key_mask = None
+            if self.service.settings.proxy.mode == "cloudflare_worker":
+                if not self.service.worker_rr:
+                    return ProviderStreamResult(
+                        provider=self.name,
+                        capability="chat.completions",
+                        ok=False,
+                        status_code=503,
+                        latency_ms=self.done(start),
+                        model=model_name,
+                        error="No Cloudflare worker URL configured",
+                    )
+                active_worker_slot = self.service.worker_rr.index + 1
+                active_worker_url = self.service.worker_rr.active
+                url = self.service._build_worker_url(api_version=api_version, model=model_name, method=method)
+            else:
+                if not self.service.gemini_key_rr:
+                    return ProviderStreamResult(
+                        provider=self.name,
+                        capability="chat.completions",
+                        ok=False,
+                        status_code=503,
+                        latency_ms=self.done(start),
+                        model=model_name,
+                        error="No Gemini API key configured",
+                    )
+                active_key_slot = self.service.gemini_key_rr.index + 1
+                active_key_mask = self.service._mask_key(self.service.gemini_key_rr.active)
+                url = self.service._build_direct_gemini_url(api_version=api_version, model=model_name, method=method)
+
+            headers = self.service._build_headers(request_id=None)
+            headers["accept"] = "text/event-stream"
+            request = self.service.client.build_request("POST", url, headers=headers, json={k: v for k, v in body.items() if k != "model"}, params=params)
+            try:
+                # httpx.AsyncClient.send() in 0.28.x does not accept a timeout kwarg.
+                # Per-attempt timeout is enforced by router asyncio.wait_for() wrapping this call.
+                resp = await self.service.client.send(request, stream=True)
+            except Exception as exc:  # noqa: BLE001
+                if self.service.settings.proxy.mode == "cloudflare_worker":
+                    if self.service.worker_rr:
+                        self.service.worker_rr.next()
+                elif self.service.gemini_key_rr:
+                    self.service.gemini_key_rr.next()
+                return ProviderStreamResult(
+                    provider=self.name,
+                    capability="chat.completions",
+                    ok=False,
+                    status_code=502,
+                    latency_ms=self.done(start),
+                    model=model_name,
+                    error=str(exc),
+                )
+
+            self.service._set_proxy_metadata_headers(
+                resp,
+                worker_slot=active_worker_slot,
+                worker_url=active_worker_url,
+                key_slot=active_key_slot,
+                key_pool_size=(len(self.service.gemini_key_rr.values) if self.service.gemini_key_rr else None),
+                attempts=1,
+                key_rotated=False,
+            )
+            if active_key_mask:
+                resp.headers["x-proxy-key-mask"] = active_key_mask
+
+            if resp.status_code < 400:
+                chunk_id = f"chatcmpl-{uuid4().hex[:12]}"
+                created_ts = int(time.time())
+
+                async def _stream() -> AsyncIterator[bytes]:
+                    emitted_role = False
+                    try:
+                        async for line in resp.aiter_lines():
+                            line = str(line or "").strip()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            raw = line[5:].strip()
+                            if not raw:
+                                continue
+                            if raw == "[DONE]":
+                                done_chunk = {
+                                    "id": chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_ts,
+                                    "model": model_name,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                }
+                                yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                                yield b"data: [DONE]\n\n"
+                                return
+                            try:
+                                event_payload = json.loads(raw)
+                            except Exception:
+                                continue
+                            candidates = list(event_payload.get("candidates") or [])
+                            text_chunks: List[str] = []
+                            finish_reason = None
+                            if candidates:
+                                first = candidates[0] or {}
+                                finish_reason = first.get("finishReason")
+                                parts = ((first.get("content") or {}).get("parts") or [])
+                                for part in parts:
+                                    if isinstance(part, dict):
+                                        txt = str(part.get("text") or "")
+                                        if txt:
+                                            text_chunks.append(txt)
+                            delta_payload: Dict[str, Any] = {}
+                            if not emitted_role:
+                                delta_payload["role"] = "assistant"
+                                emitted_role = True
+                            text_out = "".join(text_chunks)
+                            if text_out:
+                                delta_payload["content"] = text_out
+                            chunk = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": delta_payload,
+                                        "finish_reason": "stop" if finish_reason else None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                        terminal = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(terminal, ensure_ascii=False)}\n\n".encode("utf-8")
+                        yield b"data: [DONE]\n\n"
+                    finally:
+                        await resp.aclose()
+
+                return ProviderStreamResult(
+                    provider=self.name,
+                    capability="chat.completions",
+                    ok=True,
+                    status_code=200,
+                    latency_ms=self.done(start),
+                    model=model_name,
+                    headers=dict(resp.headers),
+                    stream=_stream(),
+                )
+
+            error_text = ""
+            try:
+                raw_error = await resp.aread()
+                error_text = raw_error.decode("utf-8", errors="ignore")
+            finally:
+                await resp.aclose()
+
+            should_retry = (
+                self.service.settings.proxy.retry_on_429 and self.service._is_429(resp)
+            ) or (
+                bool(self.service.settings.proxy.retry_on_5xx)
+                and resp.status_code >= 500
+            )
+            if should_retry:
+                if self.service.settings.proxy.mode == "cloudflare_worker":
+                    if self.service.worker_rr:
+                        self.service.worker_rr.next()
+                elif self.service.gemini_key_rr:
+                    self.service.gemini_key_rr.next()
+                continue
+            return ProviderStreamResult(
+                provider=self.name,
+                capability="chat.completions",
+                ok=False,
+                status_code=int(resp.status_code),
+                latency_ms=self.done(start),
+                model=model_name,
+                headers=dict(resp.headers),
+                error=error_text or f"upstream status={resp.status_code}",
+            )
+
+        return ProviderStreamResult(
+            provider=self.name,
+            capability="chat.completions",
+            ok=False,
+            status_code=429,
+            latency_ms=self.done(start),
+            model=model_name,
+            error="all stream retries exhausted",
+        )
 
     async def responses(self, payload: Dict[str, Any], model: str | None = None) -> ProviderResult:
         # Gemini does not expose an OpenAI Responses endpoint; map to generateContent.
