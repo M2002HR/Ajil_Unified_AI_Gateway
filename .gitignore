@@ -76,6 +76,7 @@ Pollinations_API_Proxy_Service/artifacts/images/
 Pollinations_API_Proxy_Service/artifacts/benchmarks/
 modules/pollinations_proxy/artifacts/images/
 modules/pollinations_proxy/artifacts/benchmarks/
+artifacts/load_tests/
 
 # -----------------------------
 # Embedded git repos in modules (until converted to real submodules)
