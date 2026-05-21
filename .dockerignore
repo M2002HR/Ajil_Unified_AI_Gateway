@@ -1,0 +1,33 @@
+# VCS
+.git/
+**/.git/
+
+# Local env/secrets
+.env
+.env.*
+!.env.example
+
+# Python artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+**/.venv/
+venv/
+
+# Node artifacts
+node_modules/
+**/node_modules/
+
+# Build/runtime trash
+*.log
+tmp/
+.tmp/
+artifacts/images/
+artifacts/benchmarks/

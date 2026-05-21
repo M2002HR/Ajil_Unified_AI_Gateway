@@ -1,0 +1,89 @@
+# -----------------------------
+# Secrets / Local env
+# -----------------------------
+.env
+.env.*
+!.env.example
+
+**/.env
+**/.env.*
+!**/.env.example
+
+# -----------------------------
+# Python caches / virtualenvs
+# -----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+.venv/
+venv/
+env/
+ENV/
+**/.venv/
+
+# -----------------------------
+# Build / dist artifacts
+# -----------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# -----------------------------
+# Runtime / logs / temp
+# -----------------------------
+*.log
+logs/
+*.pid
+*.pid.lock
+*.out
+*.err
+.tmp/
+tmp/
+
+# -----------------------------
+# Node / Cloudflare worker
+# -----------------------------
+node_modules/
+**/node_modules/
+.wrangler/
+**/.wrangler/
+
+# -----------------------------
+# IDE / OS
+# -----------------------------
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Project-specific generated outputs
+# -----------------------------
+Pollinations_API_Proxy_Service/artifacts/images/
+Pollinations_API_Proxy_Service/artifacts/benchmarks/
+modules/pollinations_proxy/artifacts/images/
+modules/pollinations_proxy/artifacts/benchmarks/
+
+# -----------------------------
+# Embedded git repos in modules (until converted to real submodules)
+# -----------------------------
+modules/*/.git
+
+# -----------------------------
+# Keep useful example/config files
+# -----------------------------
+!config/*.example.yml
+!**/config/*.example.yml
