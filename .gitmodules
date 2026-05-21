@@ -1,0 +1,9 @@
+[submodule "modules/groq_proxy"]
+	path = modules/groq_proxy
+	url = https://github.com/AliBalash/Groq_API_Proxy_Service
+[submodule "modules/gemini_proxy"]
+	path = modules/gemini_proxy
+	url = https://github.com/M2002HR/Gemini_API_Proxy_Service.git
+[submodule "modules/pollinations_proxy"]
+	path = modules/pollinations_proxy
+	url = https://github.com/AliBalash/Pollinations_API_Proxy_Service
