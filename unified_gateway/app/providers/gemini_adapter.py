@@ -139,24 +139,59 @@ class GeminiAdapter(ProviderAdapter):
         input_text = payload.get("input")
         if isinstance(input_text, list):
             input_text = "\n".join([str(x) for x in input_text])
-        body = {
-            "model": model_name,
+        base_body = {
             "method": "embedContent",
             "content": {"parts": [{"text": str(input_text or "")}]},
         }
+        fallback_models = [model_name, "gemini-embedding-001", "gemini-embedding-2", "gemini-embedding-2-preview"]
+        tried_models: list[str] = []
+
         try:
-            resp = await self.service.proxy_call(body)
-            parsed = resp.json()
+            for candidate_model in fallback_models:
+                if candidate_model in tried_models:
+                    continue
+                tried_models.append(candidate_model)
+                body = dict(base_body)
+                body["model"] = candidate_model
+                resp = await self.service.proxy_call(body)
+                parsed = resp.json()
+                if resp.status_code < 400:
+                    return ProviderResult(
+                        provider=self.name,
+                        capability="embeddings",
+                        ok=True,
+                        status_code=resp.status_code,
+                        latency_ms=self.done(start),
+                        payload=parsed,
+                        model=candidate_model,
+                        headers=dict(resp.headers),
+                        error="",
+                    )
+                error_message = str((parsed.get("error") or {}).get("message") or "").lower() if isinstance(parsed, dict) else ""
+                can_fallback = "not supported for embedcontent" in error_message or "is not found for api version" in error_message
+                if not can_fallback:
+                    return ProviderResult(
+                        provider=self.name,
+                        capability="embeddings",
+                        ok=False,
+                        status_code=resp.status_code,
+                        latency_ms=self.done(start),
+                        payload=parsed,
+                        model=candidate_model,
+                        headers=dict(resp.headers),
+                        error=str(parsed),
+                    )
+
+            # exhausted all fallback embedding models
             return ProviderResult(
                 provider=self.name,
                 capability="embeddings",
-                ok=resp.status_code < 400,
-                status_code=resp.status_code,
+                ok=False,
+                status_code=404,
                 latency_ms=self.done(start),
-                payload=parsed,
-                model=model_name,
-                headers=dict(resp.headers),
-                error="" if resp.status_code < 400 else str(parsed),
+                payload={"error": {"message": "No supported Gemini embedding model available"}},
+                model=(tried_models[-1] if tried_models else model_name),
+                error="No supported Gemini embedding model available",
             )
         except Exception as exc:  # noqa: BLE001
             return ProviderResult(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict
 
 from modules.groq_proxy.api.app.config import (  # type: ignore
@@ -51,6 +52,9 @@ class GroqAdapter(ProviderAdapter):
             ),
             admin=AdminSection(enabled=False),
         )
+        self.tts_default_model = str(cfg.tts_default_model or "canopylabs/orpheus-v1-english")
+        self.tts_default_voice = str(cfg.tts_default_voice or "diana")
+        self.tts_default_response_format = str(cfg.tts_default_response_format or "wav")
         self.service = GroqProxyService(settings)
 
     async def aclose(self) -> None:
@@ -65,6 +69,78 @@ class GroqAdapter(ProviderAdapter):
             except json.JSONDecodeError:
                 return {"raw": resp.text}
         return resp.content
+
+    @staticmethod
+    def _extract_error_payload(parsed: Any) -> Dict[str, Any]:
+        if isinstance(parsed, dict):
+            err = parsed.get("error")
+            if isinstance(err, dict):
+                return err
+        return {}
+
+    def _tts_fallback_candidates(self, requested_model: str) -> list[str]:
+        req = str(requested_model or "").strip().lower()
+        preferred = (
+            "canopylabs/orpheus-arabic-saudi"
+            if "arabic" in req
+            else "canopylabs/orpheus-v1-english"
+        )
+        ordered = [
+            preferred,
+            self.tts_default_model,
+            "canopylabs/orpheus-v1-english",
+            "canopylabs/orpheus-arabic-saudi",
+        ]
+        out: list[str] = []
+        for model_name in ordered:
+            m = str(model_name or "").strip()
+            if m and m not in out:
+                out.append(m)
+        return out
+
+    @staticmethod
+    def _extract_allowed_voices(message: str) -> list[str]:
+        msg = str(message or "")
+        match = re.search(r"voices?\s*:\s*\[([^\]]+)\]", msg, flags=re.IGNORECASE)
+        if not match:
+            return []
+        values = [v.strip().strip(",").lower() for v in match.group(1).split() if v.strip().strip(",")]
+        out: list[str] = []
+        for value in values:
+            if value and value not in out:
+                out.append(value)
+        return out
+
+    async def _tts_request_with_auto_fix(self, body: Dict[str, Any]) -> tuple[Any, Any, Dict[str, Any]]:
+        current = dict(body)
+        for _ in range(3):
+            resp = await self.service.forward_json(path="/audio/speech", payload=current)
+            parsed = self._parse(resp)
+            if resp.status_code < 400:
+                return resp, parsed, current
+
+            err = self._extract_error_payload(parsed)
+            err_message = str(err.get("message") or "")
+            low = err_message.lower()
+            changed = False
+
+            if "response_format must be one of [wav]" in low and str(current.get("response_format", "")).lower() != "wav":
+                current["response_format"] = "wav"
+                changed = True
+
+            allowed_voices = self._extract_allowed_voices(err_message)
+            if allowed_voices:
+                current_voice = str(current.get("voice", "")).strip().lower()
+                if current_voice not in allowed_voices:
+                    preferred_voice = self.tts_default_voice.strip().lower()
+                    current["voice"] = preferred_voice if preferred_voice in allowed_voices else allowed_voices[0]
+                    changed = True
+
+            if not changed:
+                return resp, parsed, current
+
+        resp = await self.service.forward_json(path="/audio/speech", payload=current)
+        return resp, self._parse(resp), current
 
     async def chat_completions(self, payload: Dict[str, Any], model: str | None = None) -> ProviderResult:
         start = self.started()
@@ -107,10 +183,42 @@ class GroqAdapter(ProviderAdapter):
         body = dict(payload)
         if model:
             body["model"] = model
+        body.setdefault("voice", self.tts_default_voice)
+        body.setdefault("response_format", self.tts_default_response_format)
         try:
-            resp = await self.service.forward_json(path="/audio/speech", payload=body)
-            parsed = self._parse(resp)
-            return ProviderResult(self.name, "audio.speech", resp.status_code < 400, resp.status_code, self.done(start), parsed, "" if resp.status_code < 400 else str(parsed), str(body.get("model", "")), dict(resp.headers))
+            resp, parsed, used_body = await self._tts_request_with_auto_fix(body)
+            if resp.status_code < 400:
+                return ProviderResult(self.name, "audio.speech", True, resp.status_code, self.done(start), parsed, "", str(used_body.get("model", "")), dict(resp.headers))
+
+            err = self._extract_error_payload(parsed)
+            err_code = str(err.get("code") or "").strip().lower()
+            err_message = str(err.get("message") or "").strip().lower()
+            requested_model = str(used_body.get("model", "")).strip()
+            should_retry = err_code == "model_decommissioned" or "decommissioned" in err_message
+
+            if should_retry:
+                for fallback_model in self._tts_fallback_candidates(requested_model):
+                    if fallback_model == requested_model:
+                        continue
+                    retry_body = dict(used_body)
+                    retry_body["model"] = fallback_model
+                    retry_resp, retry_parsed, retry_used_body = await self._tts_request_with_auto_fix(retry_body)
+                    if retry_resp.status_code < 400:
+                        headers = dict(retry_resp.headers)
+                        headers["x-uag-tts-fallback-from"] = requested_model
+                        headers["x-uag-tts-fallback-to"] = str(retry_used_body.get("model", fallback_model))
+                        return ProviderResult(
+                            self.name,
+                            "audio.speech",
+                            True,
+                            retry_resp.status_code,
+                            self.done(start),
+                            retry_parsed,
+                            "",
+                            str(retry_used_body.get("model", fallback_model)),
+                            headers,
+                        )
+            return ProviderResult(self.name, "audio.speech", False, resp.status_code, self.done(start), parsed, str(parsed), str(used_body.get("model", "")), dict(resp.headers))
         except Exception as exc:  # noqa: BLE001
             return ProviderResult(self.name, "audio.speech", False, 502, self.done(start), None, str(exc), str(body.get("model", "")))
 

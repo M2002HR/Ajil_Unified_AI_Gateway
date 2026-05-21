@@ -1,4 +1,4 @@
-# Ajil AI API Service
+# Ajil Unified AI Gateway
 
 A production-oriented **Unified AI Gateway** built with FastAPI.
 
@@ -283,6 +283,57 @@ ws://127.0.0.1:8080/ws/llm?token=<UAG_AUTH_TOKEN>
 ```bash
 curl -sS "http://127.0.0.1:8080/admin/usage/overview?since_minutes=60" \
   -H "x-admin-token: replace_with_admin_token"
+```
+
+---
+
+## Randomized Load Test
+
+A randomized multi-endpoint load test script is available at:
+- `scripts/load_test_gateway.py`
+
+It tests:
+- `/v1/chat/completions`
+- `/v1/responses`
+- `/v1/embeddings`
+- `/v1/orchestrate`
+- `/v1/audio/transcriptions`
+- `/v1/audio/speech`
+- `/v1/images/generations` (capped; default low count)
+
+Default behavior:
+- Total requests: `100`
+- Random scenario mix
+- Image requests capped to `4` by default
+- Model discovery via `/v1/models`
+- Gemini model selection prefers `gemma-4*`/`gemma*` when available
+- Live terminal progress + final summary + admin snapshot
+
+Run:
+
+```bash
+python3 scripts/load_test_gateway.py \
+  --base-url http://127.0.0.1:8080 \
+  --token "$UAG_AUTH_TOKEN" \
+  --token-header "${UAG_AUTH_HEADER_NAME:-x-api-token}" \
+  --admin-token "$UAG_ADMIN_TOKEN" \
+  --admin-token-header "${UAG_ADMIN_HEADER_NAME:-x-admin-token}" \
+  --total 100 \
+  --concurrency 12
+```
+
+Useful options:
+- `--max-image-requests 4` (default)
+- `--max-speech-requests 12`
+- `--max-stt-requests 10`
+- `--seed 42` for reproducible randomization
+- `--verbose` for per-request logs
+- `--no-trust-env` to ignore proxy env vars during local tests
+
+Example quick check:
+
+```bash
+python3 scripts/load_test_gateway.py --total 20 --concurrency 5 --seed 7 --no-trust-env
 ```
 
 ### 7) Admin Aggregate by Key

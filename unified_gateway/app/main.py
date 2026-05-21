@@ -7,13 +7,16 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .config import Settings, get_settings
+from .model_catalog import filter_models as filter_catalog_models
+from .model_catalog import normalize_models as normalize_catalog_models
+from .model_catalog import summarize_models as summarize_catalog_models
 from .observability import get_request_id, log_event, now_iso, reset_request_id, set_request_id, setup_logging
 from .providers.base import ProviderResult
 from .providers.gemini_adapter import gemini_to_openai_chat
@@ -41,6 +44,13 @@ class AppState:
         self.router = router
         self.usage_tracker = usage_tracker
         self.event_tracker = event_tracker
+        self.models_catalog_cache: Dict[str, Any] = {
+            "fetched_at": "",
+            "ttl_sec": 180,
+            "provider_rows": [],
+            "items": [],
+        }
+        self.models_catalog_lock = asyncio.Lock()
 
 
 @asynccontextmanager
@@ -137,6 +147,119 @@ def _to_int(value: Any, default: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, out))
 
 
+def _router_failure_status(ctx: AppState, result: Dict[str, Any], default: int = 502) -> int:
+    code = result.get("status_code")
+    try:
+        parsed = int(code)
+    except (TypeError, ValueError):
+        parsed = default
+
+    if ctx.settings.router.strict_rate_limit_errors_only:
+        return 429
+    return max(400, min(599, parsed))
+
+
+async def _refresh_models_catalog(
+    ctx: AppState,
+    *,
+    refresh: bool,
+    timeout_sec: float = 30.0,
+) -> Dict[str, Any]:
+    now_ts = time.monotonic()
+    cache = ctx.models_catalog_cache
+    ttl_sec = int(cache.get("ttl_sec") or 180)
+    fetched_at = str(cache.get("fetched_at") or "")
+    cache_age_ok = False
+    if fetched_at:
+        try:
+            cache_age_ok = (now_ts - float(cache.get("fetched_monotonic", 0.0))) <= max(10, ttl_sec)
+        except Exception:  # noqa: BLE001
+            cache_age_ok = False
+
+    if not refresh and cache_age_ok and cache.get("items") is not None:
+        return {
+            "generated_at": now_iso(),
+            "from_cache": True,
+            "fetched_at": cache.get("fetched_at"),
+            "provider_rows": list(cache.get("provider_rows") or []),
+            "items": list(cache.get("items") or []),
+        }
+
+    async with ctx.models_catalog_lock:
+        # Double-check after locking to avoid duplicate refresh.
+        now_ts = time.monotonic()
+        cache = ctx.models_catalog_cache
+        if not refresh and cache.get("items") is not None:
+            try:
+                if (now_ts - float(cache.get("fetched_monotonic", 0.0))) <= max(10, int(cache.get("ttl_sec") or 180)):
+                    return {
+                        "generated_at": now_iso(),
+                        "from_cache": True,
+                        "fetched_at": cache.get("fetched_at"),
+                        "provider_rows": list(cache.get("provider_rows") or []),
+                        "items": list(cache.get("items") or []),
+                    }
+            except Exception:  # noqa: BLE001
+                pass
+
+        async def fetch_provider(provider: str, adapter: Any) -> Dict[str, Any]:
+            started = time.monotonic()
+            try:
+                result = await asyncio.wait_for(adapter.list_models(), timeout=max(2.0, timeout_sec))
+                payload = result.payload if result.ok else {}
+                normalized = normalize_catalog_models(provider, payload if isinstance(payload, dict) else {})
+                return {
+                    "provider": provider,
+                    "ok": bool(result.ok),
+                    "status_code": int(result.status_code),
+                    "latency_ms": round(float(result.latency_ms), 3),
+                    "error": str(result.error or ""),
+                    "count": len(normalized),
+                    "items": normalized,
+                }
+            except asyncio.TimeoutError:
+                return {
+                    "provider": provider,
+                    "ok": False,
+                    "status_code": 504,
+                    "latency_ms": round((time.monotonic() - started) * 1000.0, 3),
+                    "error": f"list_models timeout after {timeout_sec}s",
+                    "count": 0,
+                    "items": [],
+                }
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "provider": provider,
+                    "ok": False,
+                    "status_code": 502,
+                    "latency_ms": round((time.monotonic() - started) * 1000.0, 3),
+                    "error": str(exc),
+                    "count": 0,
+                    "items": [],
+                }
+
+        jobs = [fetch_provider(name, adapter) for name, adapter in ctx.registry.providers.items() if hasattr(adapter, "list_models")]
+        provider_rows = await asyncio.gather(*jobs)
+        all_items: List[Dict[str, Any]] = []
+        for row in provider_rows:
+            all_items.extend(list(row.get("items") or []))
+
+        ctx.models_catalog_cache = {
+            "fetched_at": now_iso(),
+            "fetched_monotonic": time.monotonic(),
+            "ttl_sec": 180,
+            "provider_rows": provider_rows,
+            "items": all_items,
+        }
+        return {
+            "generated_at": now_iso(),
+            "from_cache": False,
+            "fetched_at": ctx.models_catalog_cache["fetched_at"],
+            "provider_rows": provider_rows,
+            "items": all_items,
+        }
+
+
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
     started = time.monotonic()
@@ -174,8 +297,17 @@ async def request_logging_middleware(request: Request, call_next):
                 "client": (request.client.host if request.client else ""),
             },
         )
+        status_code = 429 if ctx.settings.router.strict_rate_limit_errors_only else 503
+        payload = {
+            "ok": False,
+            "error": "request failed before response",
+            "detail": str(exc),
+            "request_id": request_id,
+            "status_code": status_code,
+            "error_type": "strict_rate_limited_policy" if ctx.settings.router.strict_rate_limit_errors_only else "internal_error",
+        }
         reset_request_id(token)
-        raise
+        return JSONResponse(status_code=status_code, content=payload)
 
     response.headers["x-request-id"] = request_id
     elapsed = round((time.monotonic() - started) * 1000.0, 3)
@@ -325,6 +457,104 @@ async def list_models(request: Request) -> Dict[str, Any]:
     return {"object": "list", "data": out}
 
 
+@app.get("/v1/models/catalog", dependencies=[Depends(require_client_auth)])
+async def list_models_catalog(
+    request: Request,
+    refresh: bool = Query(default=False),
+    providers: str | None = Query(default=None, description="Comma-separated providers: gemini,groq,pollinations"),
+    capability: str | None = Query(default=None),
+    model_type: str | None = Query(default=None, description="llm,embedding,image,audio_tts,audio_stt,multi,other"),
+    modality: str | None = Query(default=None, description="text,image,audio,embedding,video"),
+    include_preview: bool = Query(default=True),
+    include_paid: bool = Query(default=True),
+    search: str | None = Query(default=None),
+    include_raw: bool = Query(default=False),
+) -> Dict[str, Any]:
+    ctx = _ctx(request)
+    catalog = await _refresh_models_catalog(ctx, refresh=refresh)
+    provider_list = [x.strip().lower() for x in str(providers or "").split(",") if x.strip()]
+
+    filtered_base = filter_catalog_models(
+        list(catalog.get("items") or []),
+        providers=provider_list,
+        capability=capability,
+        model_type=model_type,
+        modality=modality,
+        include_preview=include_preview,
+        include_paid=include_paid,
+        search=search,
+    )
+    filtered = [dict(row) for row in filtered_base]
+    filtered.sort(key=lambda row: (str(row.get("provider") or ""), str(row.get("id") or "")))
+    if not include_raw:
+        for row in filtered:
+            row.pop("raw", None)
+
+    provider_status = [{k: v for k, v in row.items() if k != "items"} for row in list(catalog.get("provider_rows") or [])]
+
+    return {
+        "generated_at": now_iso(),
+        "from_cache": bool(catalog.get("from_cache")),
+        "fetched_at": catalog.get("fetched_at"),
+        "filters": {
+            "providers": provider_list,
+            "capability": capability or "",
+            "model_type": model_type or "",
+            "modality": modality or "",
+            "include_preview": include_preview,
+            "include_paid": include_paid,
+            "search": search or "",
+            "include_raw": include_raw,
+        },
+        "providers_status": provider_status,
+        "summary": summarize_catalog_models(filtered),
+        "count": len(filtered),
+        "items": filtered,
+    }
+
+
+@app.get("/v1/models/catalog/summary", dependencies=[Depends(require_client_auth)])
+async def list_models_catalog_summary(
+    request: Request,
+    refresh: bool = Query(default=False),
+) -> Dict[str, Any]:
+    ctx = _ctx(request)
+    catalog = await _refresh_models_catalog(ctx, refresh=refresh)
+    items = list(catalog.get("items") or [])
+    compact_items = [dict(item) for item in items]
+    for row in compact_items:
+        row.pop("raw", None)
+    provider_status = [{k: v for k, v in row.items() if k != "items"} for row in list(catalog.get("provider_rows") or [])]
+
+    return {
+        "generated_at": now_iso(),
+        "from_cache": bool(catalog.get("from_cache")),
+        "fetched_at": catalog.get("fetched_at"),
+        "providers_status": provider_status,
+        "summary": summarize_catalog_models(compact_items),
+    }
+
+
+@app.get("/v1/models/providers", dependencies=[Depends(require_client_auth)])
+async def list_models_providers_status(
+    request: Request,
+    refresh: bool = Query(default=False),
+    include_items: bool = Query(default=False),
+) -> Dict[str, Any]:
+    ctx = _ctx(request)
+    catalog = await _refresh_models_catalog(ctx, refresh=refresh)
+    rows = list(catalog.get("provider_rows") or [])
+    if not include_items:
+        rows = [{k: v for k, v in row.items() if k != "items"} for row in rows]
+    return {
+        "generated_at": now_iso(),
+        "from_cache": bool(catalog.get("from_cache")),
+        "fetched_at": catalog.get("fetched_at"),
+        "count": len(rows),
+        "items": rows,
+    }
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(require_client_auth)])
 async def chat_completions(request: Request, body: Dict[str, Any]) -> Response:
     ctx = _ctx(request)
@@ -333,7 +563,7 @@ async def chat_completions(request: Request, body: Dict[str, Any]) -> Response:
 
     result = await ctx.router.dispatch("chat.completions", body, options)
     if not result.get("ok"):
-        return JSONResponse(status_code=502, content=result)
+        return JSONResponse(status_code=_router_failure_status(ctx, result, default=502), content=result)
 
     winner = result.get("winner") or {}
     if winner.get("provider") == "gemini":
@@ -376,7 +606,7 @@ async def responses_api(request: Request, body: Dict[str, Any]) -> Response:
     options_raw = body.pop("x_router", None)
     options = RouterOptions.model_validate(options_raw) if options_raw else None
     result = await ctx.router.dispatch("responses", body, options)
-    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
+    return JSONResponse(status_code=200 if result.get("ok") else _router_failure_status(ctx, result, default=502), content=result)
 
 
 @app.post("/v1/embeddings", dependencies=[Depends(require_client_auth)])
@@ -385,7 +615,7 @@ async def embeddings_api(request: Request, body: Dict[str, Any]) -> Response:
     options_raw = body.pop("x_router", None)
     options = RouterOptions.model_validate(options_raw) if options_raw else None
     result = await ctx.router.dispatch("embeddings", body, options)
-    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
+    return JSONResponse(status_code=200 if result.get("ok") else _router_failure_status(ctx, result, default=502), content=result)
 
 
 @app.post("/v1/images/generations", dependencies=[Depends(require_client_auth)])
@@ -394,7 +624,7 @@ async def image_generations(request: Request, body: Dict[str, Any]) -> Response:
     options_raw = body.pop("x_router", None)
     options = RouterOptions.model_validate(options_raw) if options_raw else None
     result = await ctx.router.dispatch("images.generations", body, options)
-    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
+    return JSONResponse(status_code=200 if result.get("ok") else _router_failure_status(ctx, result, default=502), content=result)
 
 
 @app.post("/v1/audio/transcriptions", dependencies=[Depends(require_client_auth)])
@@ -409,12 +639,28 @@ async def audio_transcriptions(
         raise HTTPException(status_code=503, detail="Groq STT provider is not enabled")
 
     data = await file.read()
-    result = await adapter.stt(
-        audio_bytes=data,
-        filename=file.filename or "audio.ogg",
-        content_type=file.content_type or "audio/ogg",
-        language=language,
-    )
+    stt_timeout_sec = max(5.0, float(ctx.settings.router.parallel_timeout_sec))
+    try:
+        result = await asyncio.wait_for(
+            adapter.stt(
+                audio_bytes=data,
+                filename=file.filename or "audio.ogg",
+                content_type=file.content_type or "audio/ogg",
+                language=language,
+            ),
+            timeout=stt_timeout_sec,
+        )
+    except asyncio.TimeoutError:
+        result = ProviderResult(
+            provider="groq",
+            capability="audio.transcriptions",
+            ok=False,
+            status_code=504,
+            latency_ms=0.0,
+            payload=None,
+            error=f"provider timeout after {stt_timeout_sec}s",
+            model="",
+        )
     await ctx.usage_tracker.record(
         capability="audio.transcriptions",
         priority=0,
@@ -434,7 +680,13 @@ async def audio_transcriptions(
             "filename": str(file.filename or ""),
         },
     )
-    return JSONResponse(status_code=200 if result.ok else 502, content=result.__dict__)
+    if result.ok:
+        return JSONResponse(status_code=200, content=result.__dict__)
+    status_code = 429 if ctx.settings.router.strict_rate_limit_errors_only else 502
+    payload = dict(result.__dict__)
+    payload.setdefault("status_code", status_code)
+    payload.setdefault("error_type", "strict_rate_limited_policy" if ctx.settings.router.strict_rate_limit_errors_only else "provider_error")
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @app.post("/v1/audio/speech", dependencies=[Depends(require_client_auth)])
@@ -444,7 +696,7 @@ async def audio_speech(request: Request, body: Dict[str, Any]) -> Response:
     options = RouterOptions.model_validate(options_raw) if options_raw else None
     result = await ctx.router.dispatch("audio.speech", body, options)
     if not result.get("ok"):
-        return JSONResponse(status_code=502, content=result)
+        return JSONResponse(status_code=_router_failure_status(ctx, result, default=502), content=result)
 
     winner = result.get("winner") or {}
     payload = winner.get("payload")
@@ -468,7 +720,7 @@ async def audio_speech(request: Request, body: Dict[str, Any]) -> Response:
 async def orchestrate(request: Request, body: OrchestrateRequest) -> Response:
     ctx = _ctx(request)
     result = await ctx.router.dispatch(body.capability, dict(body.payload), body.x_router)
-    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
+    return JSONResponse(status_code=200 if result.get("ok") else _router_failure_status(ctx, result, default=502), content=result)
 
 
 @app.get("/admin/router/stats", dependencies=[Depends(require_admin_auth)])
