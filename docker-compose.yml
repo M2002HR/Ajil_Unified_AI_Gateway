@@ -1,0 +1,58 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: uag-redis
+    restart: unless-stopped
+    ports:
+      - "${UAG_REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Optional outbound HTTP proxy for gateway.
+  # Enabled automatically when UAG_PROXY_ENABLED=true via profile in helper script.
+  proxy2080:
+    image: ubuntu/squid:latest
+    container_name: uag-proxy2080
+    restart: unless-stopped
+    ports:
+      - "2080:3128"
+    profiles: ["proxy"]
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Useful on Linux hosts when Docker builder DNS cannot resolve public registries.
+      network: ${UAG_DOCKER_BUILD_NETWORK:-default}
+      args:
+        HTTP_PROXY: ${UAG_BUILD_HTTP_PROXY:-}
+        HTTPS_PROXY: ${UAG_BUILD_HTTPS_PROXY:-}
+        ALL_PROXY: ${UAG_BUILD_ALL_PROXY:-}
+        NO_PROXY: ${UAG_BUILD_NO_PROXY:-}
+        PIP_INDEX_URL: ${UAG_PIP_INDEX_URL:-}
+        PIP_EXTRA_INDEX_URL: ${UAG_PIP_EXTRA_INDEX_URL:-}
+    container_name: uag-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Ensure Redis works in-compose even if .env has localhost.
+      UAG_REDIS_URL: ${UAG_REDIS_URL_DOCKER:-redis://redis:6379/0}
+      # When proxy mode is enabled in .env, default to in-network proxy endpoint.
+      UAG_PROXY_URL: ${UAG_PROXY_URL_DOCKER:-http://proxy2080:3128}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
