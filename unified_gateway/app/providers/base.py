@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 
 @dataclass
@@ -16,6 +16,19 @@ class ProviderResult:
     error: str = ""
     model: str = ""
     headers: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ProviderStreamResult:
+    provider: str
+    capability: str
+    ok: bool
+    status_code: int
+    latency_ms: float
+    model: str = ""
+    error: str = ""
+    headers: Dict[str, str] = field(default_factory=dict)
+    stream: Optional[AsyncIterator[bytes]] = None
 
 
 class ProviderAdapter:
