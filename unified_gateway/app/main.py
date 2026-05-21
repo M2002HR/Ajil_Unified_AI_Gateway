@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from .config import Settings, get_settings
 from .model_catalog import filter_models as filter_catalog_models
@@ -51,6 +52,8 @@ class AppState:
             "items": [],
         }
         self.models_catalog_lock = asyncio.Lock()
+        self.image_options_cache: Dict[str, Any] = {}
+        self.image_options_lock = asyncio.Lock()
 
 
 @asynccontextmanager
@@ -133,6 +136,7 @@ app = FastAPI(
 )
 app_logger = logging.getLogger("uag.http")
 ADMIN_UI_ROOT = Path(__file__).resolve().parent / "admin_ui"
+STUDIO_UI_ROOT = Path(__file__).resolve().parent / "studio_ui"
 
 
 def _ctx(request: Request) -> AppState:
@@ -154,9 +158,138 @@ def _router_failure_status(ctx: AppState, result: Dict[str, Any], default: int =
     except (TypeError, ValueError):
         parsed = default
 
-    if ctx.settings.router.strict_rate_limit_errors_only:
-        return 429
     return max(400, min(599, parsed))
+
+
+def _family_from_model_id(model_id: str) -> str:
+    lid = str(model_id or "").lower()
+    for name in ("gemma", "gemini", "llama", "mixtral", "qwen", "gpt", "whisper", "flux", "seedream", "kontext", "orpheus"):
+        if name in lid:
+            return name
+    return "other"
+
+
+def _build_static_fallback_catalog(settings: Settings) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_row(
+        provider: str,
+        model_id: str,
+        *,
+        capabilities: List[str],
+        model_type: str,
+        input_modalities: List[str],
+        output_modalities: List[str],
+        label: str | None = None,
+        preview: bool = False,
+    ) -> None:
+        normalized_id = str(model_id or "").strip()
+        if not normalized_id:
+            return
+        key = (provider, normalized_id)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append(
+            {
+                "provider": provider,
+                "id": normalized_id,
+                "name": normalized_id,
+                "label": str(label or normalized_id),
+                "family": _family_from_model_id(normalized_id),
+                "capabilities": list(capabilities),
+                "model_type": model_type,
+                "input_modalities": list(input_modalities),
+                "output_modalities": list(output_modalities),
+                "preview": bool(preview),
+                "paid_only": None,
+                "context_window": None,
+                "max_output_tokens": None,
+                "raw": {"source": "settings_fallback"},
+            }
+        )
+
+    # Gemini
+    add_row(
+        "gemini",
+        settings.gemini.default_model,
+        capabilities=["chat.completions", "responses"],
+        model_type="llm",
+        input_modalities=["text"],
+        output_modalities=["text"],
+    )
+    add_row(
+        "gemini",
+        "gemini-embedding-001",
+        capabilities=["embeddings"],
+        model_type="embedding",
+        input_modalities=["text"],
+        output_modalities=["embedding"],
+    )
+    add_row(
+        "gemini",
+        "gemini-embedding-2",
+        capabilities=["embeddings"],
+        model_type="embedding",
+        input_modalities=["text"],
+        output_modalities=["embedding"],
+        preview=True,
+    )
+
+    # Groq
+    add_row(
+        "groq",
+        "llama-3.3-70b-versatile",
+        capabilities=["chat.completions", "responses"],
+        model_type="llm",
+        input_modalities=["text"],
+        output_modalities=["text"],
+    )
+    add_row(
+        "groq",
+        settings.groq.stt_primary_model,
+        capabilities=["audio.transcriptions"],
+        model_type="audio_stt",
+        input_modalities=["audio"],
+        output_modalities=["text"],
+    )
+    add_row(
+        "groq",
+        settings.groq.stt_fallback_model,
+        capabilities=["audio.transcriptions"],
+        model_type="audio_stt",
+        input_modalities=["audio"],
+        output_modalities=["text"],
+    )
+    add_row(
+        "groq",
+        settings.groq.tts_default_model,
+        capabilities=["audio.speech"],
+        model_type="audio_tts",
+        input_modalities=["text"],
+        output_modalities=["audio"],
+    )
+
+    # Pollinations
+    add_row(
+        "pollinations",
+        settings.pollinations.default_image_model,
+        capabilities=["images.generations"],
+        model_type="image",
+        input_modalities=["text"],
+        output_modalities=["image"],
+    )
+    add_row(
+        "pollinations",
+        "flux",
+        capabilities=["images.generations"],
+        model_type="image",
+        input_modalities=["text"],
+        output_modalities=["image"],
+    )
+
+    return rows
 
 
 async def _refresh_models_catalog(
@@ -183,6 +316,7 @@ async def _refresh_models_catalog(
             "fetched_at": cache.get("fetched_at"),
             "provider_rows": list(cache.get("provider_rows") or []),
             "items": list(cache.get("items") or []),
+            "fallback_applied": bool(cache.get("fallback_applied")),
         }
 
     async with ctx.models_catalog_lock:
@@ -198,6 +332,7 @@ async def _refresh_models_catalog(
                         "fetched_at": cache.get("fetched_at"),
                         "provider_rows": list(cache.get("provider_rows") or []),
                         "items": list(cache.get("items") or []),
+                        "fallback_applied": bool(cache.get("fallback_applied")),
                     }
             except Exception:  # noqa: BLE001
                 pass
@@ -244,12 +379,25 @@ async def _refresh_models_catalog(
         for row in provider_rows:
             all_items.extend(list(row.get("items") or []))
 
+        fallback_applied = False
+        if not all_items:
+            fallback_applied = True
+            all_items = _build_static_fallback_catalog(ctx.settings)
+            counts_by_provider: Dict[str, int] = {}
+            for item in all_items:
+                p = str(item.get("provider") or "")
+                counts_by_provider[p] = counts_by_provider.get(p, 0) + 1
+            for row in provider_rows:
+                provider_key = str(row.get("provider") or "")
+                row["fallback_count"] = counts_by_provider.get(provider_key, 0)
+
         ctx.models_catalog_cache = {
             "fetched_at": now_iso(),
             "fetched_monotonic": time.monotonic(),
             "ttl_sec": 180,
             "provider_rows": provider_rows,
             "items": all_items,
+            "fallback_applied": fallback_applied,
         }
         return {
             "generated_at": now_iso(),
@@ -257,7 +405,181 @@ async def _refresh_models_catalog(
             "fetched_at": ctx.models_catalog_cache["fetched_at"],
             "provider_rows": provider_rows,
             "items": all_items,
+            "fallback_applied": fallback_applied,
         }
+
+
+def _normalize_image_option_values(values: Any) -> List[str]:
+    if isinstance(values, str):
+        parts = [x.strip() for x in values.split(",") if x.strip()]
+        return list(dict.fromkeys(parts))
+    if isinstance(values, list):
+        out = [str(x).strip() for x in values if str(x).strip()]
+        return list(dict.fromkeys(out))
+    return []
+
+
+def _extract_allowed_values_from_error(message: str, field_name: str) -> List[str]:
+    text = str(message or "")
+    patterns = [
+        rf"{re.escape(field_name)}\s*(?:must be|should be|is)\s*(?:one of|in)\s*\[([^\]]+)\]",
+        rf"{re.escape(field_name)}\s*(?:allowed values|valid values?)\s*[:=]\s*([A-Za-z0-9_,\-\sx]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        raw = match.group(1)
+        candidates = [x.strip().strip("'\"") for x in re.split(r"[,\s]+", raw) if x.strip().strip("'\"")]
+        if candidates:
+            return list(dict.fromkeys(candidates))
+    return []
+
+
+def _extract_image_options_from_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
+    size_keys = ["sizes", "supported_sizes", "allowed_sizes", "size_options", "resolutions"]
+    quality_keys = ["qualities", "supported_qualities", "allowed_qualities", "quality_options"]
+    defaults = {
+        "size": str(raw.get("default_size") or raw.get("size") or "").strip(),
+        "quality": str(raw.get("default_quality") or raw.get("quality") or "").strip(),
+    }
+
+    sizes: List[str] = []
+    qualities: List[str] = []
+    for key in size_keys:
+        sizes.extend(_normalize_image_option_values(raw.get(key)))
+    for key in quality_keys:
+        qualities.extend(_normalize_image_option_values(raw.get(key)))
+
+    params = raw.get("params") if isinstance(raw.get("params"), dict) else {}
+    if isinstance(params, dict):
+        sizes.extend(_normalize_image_option_values(params.get("size")))
+        qualities.extend(_normalize_image_option_values(params.get("quality")))
+
+    return {
+        "sizes": list(dict.fromkeys([x for x in sizes if x])),
+        "qualities": list(dict.fromkeys([x for x in qualities if x])),
+        "default_size": defaults["size"],
+        "default_quality": defaults["quality"],
+    }
+
+
+async def _resolve_image_options(
+    ctx: AppState,
+    *,
+    provider: str,
+    model: str,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    provider_key = str(provider or "").strip().lower()
+    model_name = str(model or "").strip()
+    if not provider_key or not model_name:
+        raise HTTPException(status_code=400, detail="provider and model are required")
+
+    cache_key = f"{provider_key}:{model_name}"
+    ttl_sec = 1800
+    now_ts = time.monotonic()
+
+    if not refresh:
+        async with ctx.image_options_lock:
+            cached = ctx.image_options_cache.get(cache_key)
+            if cached and (now_ts - float(cached.get("fetched_monotonic", 0.0))) <= ttl_sec:
+                return dict(cached.get("payload") or {})
+
+    catalog = await _refresh_models_catalog(ctx, refresh=False)
+    row = next(
+        (
+            item
+            for item in (catalog.get("items") or [])
+            if str(item.get("provider") or "").lower() == provider_key and str(item.get("id") or "") == model_name
+        ),
+        None,
+    )
+    raw = dict((row or {}).get("raw") or {})
+    extracted = _extract_image_options_from_raw(raw)
+
+    size_candidates = extracted["sizes"] or ["512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"]
+    quality_candidates = extracted["qualities"] or ["low", "medium", "high", "standard", "hd", "auto"]
+    default_size = extracted["default_size"] or ("1024x1024" if "1024x1024" in size_candidates else size_candidates[0])
+    default_quality = extracted["default_quality"] or ("medium" if "medium" in quality_candidates else quality_candidates[0])
+
+    async def try_once(size: str, quality: str, timeout_sec: float = 8.0) -> Dict[str, Any]:
+        payload = {
+            "model": [{"provider": provider_key, "model": model_name, "priority": 0}],
+            "prompt": "Minimal test image.",
+            "size": size,
+            "quality": quality,
+            "n": 1,
+            "response_format": "b64_json",
+        }
+        options = RouterOptions(
+            providers=[provider_key],
+            strategy="fallback_chain",
+            mode="limit_safe",
+            timeout_sec=timeout_sec,
+            max_attempts=1,
+        )
+        result = await ctx.router.dispatch("images.generations", payload, options)
+        if result.get("ok"):
+            return {"ok": True, "status_code": 200, "error": ""}
+        first_error = ""
+        for item in list(result.get("results") or []):
+            err = str(item.get("error") or "")
+            if err:
+                first_error = err
+                break
+        return {
+            "ok": False,
+            "status_code": int(result.get("status_code") or 502),
+            "error": first_error or str(result.get("error_type") or "probe_failed"),
+        }
+
+    detected_qualities: List[str] = []
+    for quality in quality_candidates:
+        outcome = await try_once(default_size, quality)
+        if outcome["ok"]:
+            detected_qualities.append(quality)
+            continue
+        allowed = _extract_allowed_values_from_error(outcome["error"], "quality")
+        if allowed:
+            detected_qualities = [q for q in quality_candidates if q in allowed] or allowed
+            break
+
+    if not detected_qualities:
+        detected_qualities = [default_quality]
+    detected_quality = detected_qualities[0]
+
+    detected_sizes: List[str] = []
+    for size in size_candidates:
+        outcome = await try_once(size, detected_quality)
+        if outcome["ok"]:
+            detected_sizes.append(size)
+            continue
+        allowed = _extract_allowed_values_from_error(outcome["error"], "size")
+        if allowed:
+            detected_sizes = [s for s in size_candidates if s in allowed] or allowed
+            break
+
+    if not detected_sizes:
+        detected_sizes = [default_size]
+
+    payload = {
+        "provider": provider_key,
+        "model": model_name,
+        "sizes": list(dict.fromkeys([s for s in detected_sizes if s])),
+        "qualities": list(dict.fromkeys([q for q in detected_qualities if q])),
+        "default_size": default_size,
+        "default_quality": default_quality,
+        "source": "probe+raw",
+        "fetched_at": now_iso(),
+    }
+
+    async with ctx.image_options_lock:
+        ctx.image_options_cache[cache_key] = {
+            "fetched_monotonic": time.monotonic(),
+            "payload": payload,
+        }
+    return payload
 
 
 @app.middleware("http")
@@ -297,14 +619,14 @@ async def request_logging_middleware(request: Request, call_next):
                 "client": (request.client.host if request.client else ""),
             },
         )
-        status_code = 429 if ctx.settings.router.strict_rate_limit_errors_only else 503
+        status_code = 503
         payload = {
             "ok": False,
             "error": "request failed before response",
             "detail": str(exc),
             "request_id": request_id,
             "status_code": status_code,
-            "error_type": "strict_rate_limited_policy" if ctx.settings.router.strict_rate_limit_errors_only else "internal_error",
+            "error_type": "internal_error",
         }
         reset_request_id(token)
         return JSONResponse(status_code=status_code, content=payload)
@@ -496,6 +818,7 @@ async def list_models_catalog(
         "generated_at": now_iso(),
         "from_cache": bool(catalog.get("from_cache")),
         "fetched_at": catalog.get("fetched_at"),
+        "fallback_applied": bool(catalog.get("fallback_applied")),
         "filters": {
             "providers": provider_list,
             "capability": capability or "",
@@ -530,6 +853,7 @@ async def list_models_catalog_summary(
         "generated_at": now_iso(),
         "from_cache": bool(catalog.get("from_cache")),
         "fetched_at": catalog.get("fetched_at"),
+        "fallback_applied": bool(catalog.get("fallback_applied")),
         "providers_status": provider_status,
         "summary": summarize_catalog_models(compact_items),
     }
@@ -550,16 +874,52 @@ async def list_models_providers_status(
         "generated_at": now_iso(),
         "from_cache": bool(catalog.get("from_cache")),
         "fetched_at": catalog.get("fetched_at"),
+        "fallback_applied": bool(catalog.get("fallback_applied")),
         "count": len(rows),
         "items": rows,
     }
 
 
+@app.get("/v1/images/options", dependencies=[Depends(require_client_auth)])
+async def image_model_options(
+    request: Request,
+    provider: str = Query(..., description="Image provider, e.g. pollinations"),
+    model: str = Query(..., description="Image model id"),
+    refresh: bool = Query(default=False),
+) -> Dict[str, Any]:
+    ctx = _ctx(request)
+    payload = await _resolve_image_options(ctx, provider=provider, model=model, refresh=refresh)
+    return payload
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(require_client_auth)])
 async def chat_completions(request: Request, body: Dict[str, Any]) -> Response:
     ctx = _ctx(request)
+    stream_enabled = bool(body.get("stream"))
     options_raw = body.pop("x_router", None)
     options = RouterOptions.model_validate(options_raw) if options_raw else None
+
+    if stream_enabled:
+        stream_result = await ctx.router.dispatch_chat_stream(body, options)
+        if not stream_result.get("ok"):
+            return JSONResponse(status_code=_router_failure_status(ctx, stream_result, default=502), content=stream_result)
+        stream_iter = stream_result.get("stream")
+        if stream_iter is None:
+            stream_result["ok"] = False
+            stream_result["status_code"] = 502
+            stream_result["error_type"] = "stream_unavailable"
+            return JSONResponse(status_code=502, content=stream_result)
+
+        winner = stream_result.get("winner") or {}
+        headers = {
+            "cache-control": "no-cache",
+            "connection": "keep-alive",
+            "x-uag-router-strategy": str(stream_result.get("strategy") or ""),
+            "x-uag-router-mode": str(stream_result.get("mode") or ""),
+            "x-uag-provider": str(winner.get("provider") or ""),
+            "x-uag-model": str(winner.get("model") or ""),
+        }
+        return StreamingResponse(stream_iter, media_type="text/event-stream", headers=headers)
 
     result = await ctx.router.dispatch("chat.completions", body, options)
     if not result.get("ok"):
@@ -682,10 +1042,14 @@ async def audio_transcriptions(
     )
     if result.ok:
         return JSONResponse(status_code=200, content=result.__dict__)
-    status_code = 429 if ctx.settings.router.strict_rate_limit_errors_only else 502
+    status_code = max(400, min(599, int(result.status_code or 502)))
     payload = dict(result.__dict__)
-    payload.setdefault("status_code", status_code)
-    payload.setdefault("error_type", "strict_rate_limited_policy" if ctx.settings.router.strict_rate_limit_errors_only else "provider_error")
+    payload["status_code"] = status_code
+    payload["error_type"] = (
+        "all_rate_limited"
+        if status_code == 429
+        else ("upstream_timeout" if status_code in {408, 504} else "provider_error")
+    )
     return JSONResponse(status_code=status_code, content=payload)
 
 
@@ -920,6 +1284,32 @@ async def admin_panel_assets(asset_path: str) -> Response:
 
     if not target.exists():
         raise HTTPException(status_code=404, detail="Admin panel UI not found")
+    return FileResponse(target)
+
+
+@app.get("/studio", include_in_schema=False)
+@app.get("/studio/", include_in_schema=False)
+async def studio_index() -> Response:
+    index_path = STUDIO_UI_ROOT / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Studio UI not found")
+    return FileResponse(index_path)
+
+
+@app.get("/studio/{asset_path:path}", include_in_schema=False)
+async def studio_assets(asset_path: str) -> Response:
+    cleaned = (asset_path or "").strip().lstrip("/")
+    if not cleaned:
+        target = STUDIO_UI_ROOT / "index.html"
+    else:
+        target = (STUDIO_UI_ROOT / cleaned).resolve()
+        if not str(target).startswith(str(STUDIO_UI_ROOT.resolve())):
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if not target.exists() or not target.is_file():
+            target = STUDIO_UI_ROOT / "index.html"
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Studio UI not found")
     return FileResponse(target)
 
 
