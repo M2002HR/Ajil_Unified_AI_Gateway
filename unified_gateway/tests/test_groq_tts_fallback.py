@@ -34,7 +34,9 @@ class _FakeService:
 
 
 @pytest.mark.asyncio
-async def test_tts_fallback_from_decommissioned_playai_model():
+async def test_tts_fallback_from_decommissioned_playai_model(monkeypatch):
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:2080")
+    monkeypatch.setenv("all_proxy", "socks5://127.0.0.1:2080")
     adapter = GroqAdapter(GroqProviderConfig(api_keys=["dummy"]))
     adapter.service = _FakeService(
         responses=[
@@ -69,4 +71,3 @@ async def test_tts_fallback_from_decommissioned_playai_model():
     assert len(adapter.service.calls) == 2
     assert adapter.service.calls[0]["payload"]["model"] == "playai-tts"
     assert adapter.service.calls[1]["payload"]["model"] == "canopylabs/orpheus-v1-english"
-
