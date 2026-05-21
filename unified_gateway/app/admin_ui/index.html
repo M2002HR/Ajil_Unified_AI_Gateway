@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>UAG Admin Control Panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/admin/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/echarts@6.0.0/dist/echarts.min.js" defer></script>
+  <script src="/admin/app.js" defer></script>
+</head>
+<body>
+  <div class="bg-glow bg-glow-a"></div>
+  <div class="bg-glow bg-glow-b"></div>
+  <div class="bg-grid"></div>
+
+  <main id="app" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-dot"></div>
+        <div>
+          <h1>UAG Control</h1>
+          <p>Unified AI Gateway</p>
+        </div>
+      </div>
+
+      <nav id="menu" class="menu"></nav>
+
+      <div class="sidebar-foot">
+        <div class="meta-box">
+          <div class="meta-row">
+            <span>WS</span>
+            <span id="wsStatus" class="badge warn">connecting</span>
+          </div>
+          <div class="meta-row">
+            <span>Last tick</span>
+            <span id="lastTick">-</span>
+          </div>
+          <div class="meta-row">
+            <span>Since</span>
+            <span id="sinceLabel">60m</span>
+          </div>
+        </div>
+        <button id="logoutBtn" class="btn btn-ghost">Logout</button>
+      </div>
+    </aside>
+
+    <section class="content">
+      <header class="topbar glass">
+        <div>
+          <h2 id="pageTitle">Overview</h2>
+          <p id="pageDesc">Realtime observability, analytics and operational controls</p>
+        </div>
+        <div class="topbar-actions">
+          <label class="inline-control">Window
+            <select id="sinceSelect">
+              <option value="5">5m</option>
+              <option value="15">15m</option>
+              <option value="30">30m</option>
+              <option value="60" selected>60m</option>
+              <option value="180">3h</option>
+              <option value="720">12h</option>
+              <option value="1440">24h</option>
+            </select>
+          </label>
+          <button id="pauseWsBtn" class="btn">Pause Live</button>
+          <button id="refreshBtn" class="btn">Refresh</button>
+        </div>
+      </header>
+
+      <section id="page-dashboard" class="page"></section>
+      <section id="page-events" class="page hidden"></section>
+      <section id="page-usage" class="page hidden"></section>
+      <section id="page-http" class="page hidden"></section>
+      <section id="page-router" class="page hidden"></section>
+      <section id="page-keys" class="page hidden"></section>
+    </section>
+  </main>
+
+  <section id="loginView" class="login-view">
+    <div class="login-card glass">
+      <h2>Admin Access</h2>
+      <p>Use your admin token to open the UAG monitoring console.</p>
+      <form id="loginForm" class="stack">
+        <label>Admin Token
+          <input id="adminToken" type="password" autocomplete="off" required />
+        </label>
+        <label>Header Name
+          <input id="adminHeader" type="text" value="x-admin-token" autocomplete="off" />
+        </label>
+        <button type="submit" class="btn btn-wide">Enter Panel</button>
+      </form>
+      <div id="loginError" class="error-text"></div>
+    </div>
+  </section>
+
+  <div id="modalOverlay" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal-shell glass" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head">
+        <h3 id="modalTitle">Details</h3>
+        <button id="modalCloseBtn" class="btn icon-only" title="Close" aria-label="Close">x</button>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toastRoot" class="toast-root" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>
