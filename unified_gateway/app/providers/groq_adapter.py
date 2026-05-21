@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from typing import Any, Dict
+from typing import Any, AsyncIterator, Dict
 
 from modules.groq_proxy.api.app.config import (  # type: ignore
     AdminSection,
@@ -14,7 +15,7 @@ from modules.groq_proxy.api.app.config import (  # type: ignore
 from modules.groq_proxy.api.app.services import GroqProxyService  # type: ignore
 
 from ..config import GroqProviderConfig
-from .base import ProviderAdapter, ProviderResult
+from .base import ProviderAdapter, ProviderResult, ProviderStreamResult
 
 
 class GroqAdapter(ProviderAdapter):
@@ -154,6 +155,112 @@ class GroqAdapter(ProviderAdapter):
         except Exception as exc:  # noqa: BLE001
             return ProviderResult(self.name, "chat.completions", False, 502, self.done(start), None, str(exc), str(body.get("model", "")))
 
+    async def chat_completions_stream(
+        self,
+        payload: Dict[str, Any],
+        model: str | None = None,
+        *,
+        timeout_sec: float | None = None,
+    ) -> ProviderStreamResult:
+        start = self.started()
+        body = dict(payload)
+        if model:
+            body["model"] = model
+        body["stream"] = True
+
+        retries = max(0, int(self.service.settings.proxy.max_retries_per_key) - 1)
+        for _ in range(retries + 1):
+            await self.service.limiter.wait()
+            key = self.service.key_rr.active
+            headers = self.service._build_headers(key=key, extra_headers={"accept": "text/event-stream"})
+            url = self.service._join_url(self.service.settings.groq.base_url, "/chat/completions")
+            request = self.service.client.build_request("POST", url, headers=headers, json=body)
+            try:
+                # httpx.AsyncClient.send() in 0.28.x does not accept a timeout kwarg.
+                # Per-attempt timeout is enforced by router asyncio.wait_for() wrapping this call.
+                resp = await self.service.client.send(request, stream=True)
+            except Exception as exc:  # noqa: BLE001
+                self.service.key_rr.next()
+                return ProviderStreamResult(
+                    provider=self.name,
+                    capability="chat.completions",
+                    ok=False,
+                    status_code=502,
+                    latency_ms=self.done(start),
+                    error=str(exc),
+                    model=str(body.get("model", "")),
+                )
+
+            key_slot = self.service.key_rr.slot
+            key_mask = self.service._mask_key(key)
+            resp.headers["x-proxy-key-slot"] = str(key_slot)
+            resp.headers["x-proxy-key-mask"] = key_mask
+            resp.headers["x-proxy-key-pool-size"] = str(len(self.service.key_rr.values))
+            resp.headers["x-proxy-attempts"] = "1"
+            resp.headers["x-proxy-key-rotated"] = "false"
+
+            if resp.status_code < 400:
+                async def _stream() -> AsyncIterator[bytes]:
+                    try:
+                        async for line in resp.aiter_lines():
+                            if line is None:
+                                continue
+                            if line.strip() == "":
+                                continue
+                            yield f"{line}\n\n".encode("utf-8")
+                    finally:
+                        await resp.aclose()
+
+                return ProviderStreamResult(
+                    provider=self.name,
+                    capability="chat.completions",
+                    ok=True,
+                    status_code=200,
+                    latency_ms=self.done(start),
+                    model=str(body.get("model", "")),
+                    headers=dict(resp.headers),
+                    stream=_stream(),
+                )
+
+            error_text = ""
+            try:
+                parsed = await resp.aread()
+                error_text = parsed.decode("utf-8", errors="ignore")
+            finally:
+                await resp.aclose()
+            should_retry = (
+                resp.status_code == 429
+                or (
+                    bool(self.service.settings.proxy.retry_on_5xx)
+                    and resp.status_code >= 500
+                )
+            )
+            if should_retry:
+                self.service.key_rr.next()
+                if retries > 0:
+                    await asyncio.sleep(max(0.0, float(self.service.settings.proxy.retry_backoff_sec)))
+                continue
+            return ProviderStreamResult(
+                provider=self.name,
+                capability="chat.completions",
+                ok=False,
+                status_code=int(resp.status_code),
+                latency_ms=self.done(start),
+                error=error_text or f"upstream status={resp.status_code}",
+                model=str(body.get("model", "")),
+                headers=dict(resp.headers),
+            )
+
+        return ProviderStreamResult(
+            provider=self.name,
+            capability="chat.completions",
+            ok=False,
+            status_code=429,
+            latency_ms=self.done(start),
+            error="all stream retries exhausted",
+            model=str(body.get("model", "")),
+        )
+
     async def responses(self, payload: Dict[str, Any], model: str | None = None) -> ProviderResult:
         start = self.started()
         body = dict(payload)
@@ -162,7 +269,45 @@ class GroqAdapter(ProviderAdapter):
         try:
             resp = await self.service.forward_json(path="/responses", payload=body)
             parsed = self._parse(resp)
-            return ProviderResult(self.name, "responses", resp.status_code < 400, resp.status_code, self.done(start), parsed, "" if resp.status_code < 400 else str(parsed), str(body.get("model", "")), dict(resp.headers))
+            if resp.status_code < 400:
+                return ProviderResult(self.name, "responses", True, resp.status_code, self.done(start), parsed, "", str(body.get("model", "")), dict(resp.headers))
+
+            # Stability fallback: map OpenAI-style responses payload to chat/completions.
+            if int(resp.status_code) in {400, 404, 405, 422}:
+                mapped = dict(body)
+                if "messages" not in mapped:
+                    input_value = mapped.get("input")
+                    if isinstance(input_value, list):
+                        text_parts = []
+                        for item in input_value:
+                            if isinstance(item, dict):
+                                txt = item.get("content") or item.get("text")
+                                if txt is not None:
+                                    text_parts.append(str(txt))
+                            elif item is not None:
+                                text_parts.append(str(item))
+                        mapped["messages"] = [{"role": "user", "content": "\n".join([t for t in text_parts if t]).strip()}]
+                    else:
+                        mapped["messages"] = [{"role": "user", "content": str(input_value or "")}]
+                mapped.pop("input", None)
+                mapped.pop("instructions", None)
+                fallback_resp = await self.service.forward_json(path="/chat/completions", payload=mapped)
+                fallback_parsed = self._parse(fallback_resp)
+                headers = dict(fallback_resp.headers)
+                headers["x-uag-fallback"] = "groq.responses->chat.completions"
+                return ProviderResult(
+                    self.name,
+                    "responses",
+                    fallback_resp.status_code < 400,
+                    fallback_resp.status_code,
+                    self.done(start),
+                    fallback_parsed,
+                    "" if fallback_resp.status_code < 400 else str(fallback_parsed),
+                    str(mapped.get("model", "")),
+                    headers,
+                )
+
+            return ProviderResult(self.name, "responses", False, resp.status_code, self.done(start), parsed, str(parsed), str(body.get("model", "")), dict(resp.headers))
         except Exception as exc:  # noqa: BLE001
             return ProviderResult(self.name, "responses", False, 502, self.done(start), None, str(exc), str(body.get("model", "")))
 
