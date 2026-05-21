@@ -5,9 +5,16 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class RouterModelPreference(BaseModel):
+    provider: str
+    model: str
+    priority: int = 0
+
+
 class RouterOptions(BaseModel):
     providers: List[str] = Field(default_factory=list)
     models: List[str] = Field(default_factory=list)
+    model_preferences: List[RouterModelPreference] = Field(default_factory=list)
     strategy: Literal["fallback_chain", "parallel_race", "aggregate"] = "fallback_chain"
     mode: Literal["latency_first", "limit_safe", "quality_first"] = "latency_first"
     max_attempts: int = 6

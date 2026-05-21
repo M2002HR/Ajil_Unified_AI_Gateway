@@ -45,6 +45,11 @@ class RouterConfig(BaseModel):
     default_mode: Literal["latency_first", "limit_safe", "quality_first"] = "latency_first"
     parallel_timeout_sec: float = 25.0
     max_candidates: int = 6
+    fallback_max_attempts: int = 18
+    fallback_attempt_timeout_sec: float = 12.0
+    fallback_round_backoff_sec: float = 0.2
+    retryable_status_codes: List[int] = Field(default_factory=lambda: [408, 409, 425, 429, 500, 502, 503, 504])
+    strict_rate_limit_errors_only: bool = True
 
 
 class ProxyConfig(BaseModel):
@@ -134,6 +139,7 @@ class PollinationsProviderConfig(BaseModel):
     retry_status_codes: List[int] = Field(default_factory=lambda: [402, 429, 500, 502, 503, 504])
     retry_backoff_sec: float = 0.35
     cooldown_sec: float = 20.0
+    local_placeholder_on_failure: bool = True
     image_default_n: int = 1
     image_default_size: str = "1024x1024"
     image_default_quality: str = "medium"
@@ -184,6 +190,13 @@ def load_settings() -> Settings:
             "default_mode": os.getenv("UAG_ROUTER_DEFAULT_MODE", "latency_first"),
             "parallel_timeout_sec": float(os.getenv("UAG_ROUTER_PARALLEL_TIMEOUT_SEC", "25")),
             "max_candidates": int(os.getenv("UAG_ROUTER_MAX_CANDIDATES", "6")),
+            "fallback_max_attempts": int(os.getenv("UAG_ROUTER_FALLBACK_MAX_ATTEMPTS", "18")),
+            "fallback_attempt_timeout_sec": float(os.getenv("UAG_ROUTER_FALLBACK_ATTEMPT_TIMEOUT_SEC", "12")),
+            "fallback_round_backoff_sec": float(os.getenv("UAG_ROUTER_FALLBACK_ROUND_BACKOFF_SEC", "0.2")),
+            "retryable_status_codes": [
+                int(v) for v in _to_csv(os.getenv("UAG_ROUTER_RETRYABLE_STATUS_CODES", "408,409,425,429,500,502,503,504"))
+            ],
+            "strict_rate_limit_errors_only": _to_bool(os.getenv("UAG_ROUTER_STRICT_RATE_LIMIT_ERRORS_ONLY"), True),
         },
         "proxy": {
             "enabled": _to_bool(os.getenv("UAG_PROXY_ENABLED"), False),
@@ -259,6 +272,7 @@ def load_settings() -> Settings:
             "retry_status_codes": [int(v) for v in _to_csv(os.getenv("UAG_POLLINATIONS_RETRY_STATUS_CODES", "402,429,500,502,503,504"))],
             "retry_backoff_sec": float(os.getenv("UAG_POLLINATIONS_RETRY_BACKOFF_SEC", "0.35")),
             "cooldown_sec": float(os.getenv("UAG_POLLINATIONS_KEY_COOLDOWN_SEC", "20")),
+            "local_placeholder_on_failure": _to_bool(os.getenv("UAG_POLLINATIONS_LOCAL_PLACEHOLDER_ON_FAILURE"), True),
             "image_default_n": int(os.getenv("UAG_IMAGE_DEFAULT_N", "1")),
             "image_default_size": os.getenv("UAG_IMAGE_DEFAULT_SIZE", "1024x1024"),
             "image_default_quality": os.getenv("UAG_IMAGE_DEFAULT_QUALITY", "medium"),

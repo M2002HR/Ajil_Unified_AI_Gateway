@@ -181,6 +181,22 @@ class RoutingEngine:
             providers = sorted(list(available))
 
         candidates: List[Candidate] = []
+        if options.model_preferences:
+            for pref in options.model_preferences:
+                model_name = str(pref.model or "").strip()
+                if not model_name:
+                    continue
+                provider_hint = str(pref.provider or "").strip() or None
+                candidates.extend(
+                    self._expand_model_entry(
+                        providers=providers,
+                        available=available,
+                        provider_hint=provider_hint,
+                        model_name=model_name,
+                        priority=self._to_priority(pref.priority, default=0),
+                    )
+                )
+
         payload_candidates = self._extract_payload_model_candidates(
             payload_model=payload.get("model"),
             providers=providers,
@@ -203,13 +219,33 @@ class RoutingEngine:
                 )
 
         if not candidates:
-            defaults = {
-                "gemini": self.settings.gemini.default_model,
-                "groq": "llama-3.3-70b-versatile",
-                "pollinations": self.settings.pollinations.default_image_model,
+            defaults_by_capability = {
+                "chat.completions": {
+                    "gemini": self.settings.gemini.default_model,
+                    "groq": "llama-3.3-70b-versatile",
+                },
+                "responses": {
+                    "gemini": self.settings.gemini.default_model,
+                    "groq": "llama-3.3-70b-versatile",
+                },
+                "embeddings": {
+                    "gemini": "gemini-embedding-001",
+                },
+                "images.generations": {
+                    "pollinations": self.settings.pollinations.default_image_model,
+                },
+                "audio.transcriptions": {
+                    "groq": self.settings.groq.stt_primary_model,
+                },
+                "audio.speech": {
+                    "groq": self.settings.groq.tts_default_model,
+                },
             }
+            defaults = defaults_by_capability.get(capability, {})
             for p in providers:
-                candidates.append(Candidate(provider=p, model=defaults.get(p, ""), priority=0))
+                default_model = str(defaults.get(p, "")).strip()
+                if default_model:
+                    candidates.append(Candidate(provider=p, model=default_model, priority=0))
 
         # capability filtering
         capability_map = {
@@ -264,7 +300,41 @@ class RoutingEngine:
             ),
         )
 
-    async def _call_provider(self, capability: str, candidate: Candidate, payload: Dict[str, Any]) -> ProviderResult:
+    def _is_retryable_status(self, status_code: int) -> bool:
+        return int(status_code) in set(self.settings.router.retryable_status_codes)
+
+    def _summarize_failure(self, results: List[ProviderResult]) -> Dict[str, Any]:
+        if not results:
+            return {
+                "status_code": 429 if self.settings.router.strict_rate_limit_errors_only else 503,
+                "error_type": "no_attempt",
+                "all_rate_limited": False,
+            }
+
+        status_codes = [int(r.status_code) for r in results]
+        all_rate_limited = all(code == 429 for code in status_codes)
+        if all_rate_limited:
+            return {"status_code": 429, "error_type": "all_rate_limited", "all_rate_limited": True}
+
+        if self.settings.router.strict_rate_limit_errors_only:
+            return {"status_code": 429, "error_type": "strict_rate_limited_policy", "all_rate_limited": False}
+
+        if any(code in {408, 504} for code in status_codes):
+            return {"status_code": 504, "error_type": "upstream_timeout", "all_rate_limited": False}
+        if any(code >= 500 for code in status_codes):
+            return {"status_code": 503, "error_type": "upstream_unavailable", "all_rate_limited": False}
+        if any(code == 429 for code in status_codes):
+            return {"status_code": 429, "error_type": "rate_limited", "all_rate_limited": False}
+        return {"status_code": 502, "error_type": "upstream_failed", "all_rate_limited": False}
+
+    async def _call_provider(
+        self,
+        capability: str,
+        candidate: Candidate,
+        payload: Dict[str, Any],
+        *,
+        timeout_sec: float | None = None,
+    ) -> ProviderResult:
         adapter = self.registry.providers[candidate.provider]
 
         ok_to_call = await self.guard.allow(
@@ -284,25 +354,44 @@ class RoutingEngine:
                 model=candidate.model,
             )
 
-        if capability == "chat.completions":
-            return await adapter.chat_completions(payload, model=candidate.model)
-        if capability == "responses":
-            return await adapter.responses(payload, model=candidate.model)
-        if capability == "embeddings":
-            return await adapter.embeddings(payload, model=candidate.model)
-        if capability == "images.generations":
-            return await adapter.image_generations(payload, model=candidate.model)
-        if capability == "audio.speech":
-            return await adapter.tts(payload, model=candidate.model)
-        raise ValueError(f"Unsupported capability for _call_provider: {capability}")
+        try:
+            if capability == "chat.completions":
+                coro = adapter.chat_completions(payload, model=candidate.model)
+            elif capability == "responses":
+                coro = adapter.responses(payload, model=candidate.model)
+            elif capability == "embeddings":
+                coro = adapter.embeddings(payload, model=candidate.model)
+            elif capability == "images.generations":
+                coro = adapter.image_generations(payload, model=candidate.model)
+            elif capability == "audio.speech":
+                coro = adapter.tts(payload, model=candidate.model)
+            else:
+                raise ValueError(f"Unsupported capability for _call_provider: {capability}")
+
+            if timeout_sec and float(timeout_sec) > 0:
+                return await asyncio.wait_for(coro, timeout=max(1.0, float(timeout_sec)))
+            return await coro
+        except asyncio.TimeoutError:
+            return ProviderResult(
+                provider=candidate.provider,
+                capability=capability,
+                ok=False,
+                status_code=504,
+                latency_ms=0.0,
+                payload=None,
+                error=f"provider timeout after {timeout_sec}s",
+                model=candidate.model,
+            )
 
     async def _call_provider_with_candidate(
         self,
         capability: str,
         candidate: Candidate,
         payload: Dict[str, Any],
+        *,
+        timeout_sec: float | None = None,
     ) -> Tuple[Candidate, ProviderResult]:
-        result = await self._call_provider(capability, candidate, payload)
+        result = await self._call_provider(capability, candidate, payload, timeout_sec=timeout_sec)
         return candidate, result
 
     async def _record_usage(self, capability: str, candidate: Candidate, result: ProviderResult) -> None:
@@ -325,47 +414,90 @@ class RoutingEngine:
             data=data,
         )
 
-    async def _fallback_chain(self, capability: str, candidates: List[Candidate], payload: Dict[str, Any]) -> Tuple[Optional[ProviderResult], List[ProviderResult]]:
+    async def _fallback_chain(
+        self,
+        capability: str,
+        candidates: List[Candidate],
+        payload: Dict[str, Any],
+        *,
+        timeout_sec: float | None = None,
+        max_attempts: int | None = None,
+        mode: str = "latency_first",
+    ) -> Tuple[Optional[ProviderResult], List[ProviderResult]]:
         results: List[ProviderResult] = []
-        for c in candidates:
-            res = await self._call_provider(capability, c, payload)
-            self._update_score(res)
-            await self._record_usage(capability, c, res)
-            if self.settings.logging.enabled and self.settings.logging.log_provider_attempts:
-                log_event(
-                    self.logger,
-                    event="router.provider.attempt",
-                    level=logging.INFO if res.ok else logging.WARNING,
+        attempt_budget = max(len(candidates), int(max_attempts or self.settings.router.fallback_max_attempts))
+        attempts_done = 0
+        deadline_ts: float | None = None
+        if timeout_sec and float(timeout_sec) > 0:
+            deadline_ts = time.monotonic() + max(1.0, float(timeout_sec))
+
+        while attempts_done < attempt_budget:
+            round_candidates = self._sort_candidates(list(candidates), mode)
+            round_results: List[ProviderResult] = []
+            for c in round_candidates:
+                if attempts_done >= attempt_budget:
+                    break
+                call_timeout = timeout_sec
+                if deadline_ts is not None:
+                    remaining = deadline_ts - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    call_timeout = min(float(timeout_sec or remaining), remaining)
+                per_attempt_cap = max(1.0, float(self.settings.router.fallback_attempt_timeout_sec))
+                if call_timeout is None:
+                    call_timeout = per_attempt_cap
+                else:
+                    call_timeout = min(float(call_timeout), per_attempt_cap)
+                res = await self._call_provider(capability, c, payload, timeout_sec=call_timeout)
+                attempts_done += 1
+                self._update_score(res)
+                await self._record_usage(capability, c, res)
+                if self.settings.logging.enabled and self.settings.logging.log_provider_attempts:
+                    log_event(
+                        self.logger,
+                        event="router.provider.attempt",
+                        level=logging.INFO if res.ok else logging.WARNING,
+                        message="provider attempt completed",
+                        capability=capability,
+                        provider=c.provider,
+                        model=c.model,
+                        priority=c.priority,
+                        ok=res.ok,
+                        status_code=res.status_code,
+                        latency_ms=round(res.latency_ms, 3),
+                    )
+                await self._record_event(
+                    event_type="router.provider.attempt",
+                    level="INFO" if res.ok else "WARNING",
                     message="provider attempt completed",
-                    capability=capability,
-                    provider=c.provider,
-                    model=c.model,
-                    priority=c.priority,
-                    ok=res.ok,
-                    status_code=res.status_code,
-                    latency_ms=round(res.latency_ms, 3),
+                    data={
+                        "capability": capability,
+                        "provider": c.provider,
+                        "model": c.model,
+                        "priority": c.priority,
+                        "ok": bool(res.ok),
+                        "status_code": int(res.status_code),
+                        "latency_ms": round(res.latency_ms, 3),
+                    },
                 )
-            await self._record_event(
-                event_type="router.provider.attempt",
-                level="INFO" if res.ok else "WARNING",
-                message="provider attempt completed",
-                data={
-                    "capability": capability,
-                    "provider": c.provider,
-                    "model": c.model,
-                    "priority": c.priority,
-                    "ok": bool(res.ok),
-                    "status_code": int(res.status_code),
-                    "latency_ms": round(res.latency_ms, 3),
-                },
-            )
-            results.append(res)
-            if res.ok:
-                return res, results
+                results.append(res)
+                round_results.append(res)
+                if res.ok:
+                    return res, results
+
+            if not round_results:
+                break
+            if all(not self._is_retryable_status(int(item.status_code)) for item in round_results):
+                break
+            if attempts_done >= attempt_budget:
+                break
+            backoff = max(0.0, float(self.settings.router.fallback_round_backoff_sec))
+            if backoff > 0:
+                await asyncio.sleep(backoff)
         return None, results
 
     async def _parallel_race(self, capability: str, candidates: List[Candidate], payload: Dict[str, Any], timeout_sec: float) -> Tuple[Optional[ProviderResult], List[ProviderResult]]:
-        tasks = [asyncio.create_task(self._call_provider_with_candidate(capability, c, payload)) for c in candidates]
+        tasks = [asyncio.create_task(self._call_provider_with_candidate(capability, c, payload, timeout_sec=timeout_sec)) for c in candidates]
         results: List[ProviderResult] = []
         winner: Optional[ProviderResult] = None
         try:
@@ -452,7 +584,7 @@ class RoutingEngine:
         return winner, results
 
     async def _aggregate(self, capability: str, candidates: List[Candidate], payload: Dict[str, Any], timeout_sec: float) -> List[ProviderResult]:
-        tasks = [asyncio.create_task(self._call_provider_with_candidate(capability, c, payload)) for c in candidates]
+        tasks = [asyncio.create_task(self._call_provider_with_candidate(capability, c, payload, timeout_sec=timeout_sec)) for c in candidates]
         task_map = {task: candidate for task, candidate in zip(tasks, candidates)}
         results: List[ProviderResult] = []
         done, pending = await asyncio.wait(tasks, timeout=max(1.0, timeout_sec))
@@ -554,14 +686,19 @@ class RoutingEngine:
 
         if options.strategy == "aggregate":
             results = await self._aggregate(capability, candidates, payload, timeout_sec=options.timeout_sec)
+            winner_result = next((r for r in results if r.ok), None)
+            failure_meta = self._summarize_failure(results) if winner_result is None else {}
             out = {
                 "ok": any(r.ok for r in results),
                 "strategy": "aggregate",
                 "mode": options.mode,
                 "capability": capability,
                 "latency_ms": round((time.monotonic() - started) * 1000.0, 2),
-                "winner": next((r.__dict__ for r in results if r.ok), None),
+                "winner": winner_result.__dict__ if winner_result else None,
                 "results": [r.__dict__ for r in results],
+                "status_code": int((winner_result.status_code if winner_result else failure_meta.get("status_code", 502))),
+                "error_type": str(failure_meta.get("error_type", "")) if winner_result is None else "",
+                "all_rate_limited": bool(failure_meta.get("all_rate_limited", False)) if winner_result is None else False,
             }
             if self.settings.logging.enabled and self.settings.logging.log_router_dispatch:
                 log_event(
@@ -597,6 +734,7 @@ class RoutingEngine:
 
         if options.strategy == "parallel_race":
             winner, results = await self._parallel_race(capability, candidates, payload, timeout_sec=options.timeout_sec)
+            failure_meta = self._summarize_failure(results) if winner is None else {}
             out = {
                 "ok": winner is not None,
                 "strategy": "parallel_race",
@@ -605,6 +743,9 @@ class RoutingEngine:
                 "latency_ms": round((time.monotonic() - started) * 1000.0, 2),
                 "winner": winner.__dict__ if winner else None,
                 "results": [r.__dict__ for r in results],
+                "status_code": int((winner.status_code if winner else failure_meta.get("status_code", 502))),
+                "error_type": str(failure_meta.get("error_type", "")) if winner is None else "",
+                "all_rate_limited": bool(failure_meta.get("all_rate_limited", False)) if winner is None else False,
             }
             if self.settings.logging.enabled and self.settings.logging.log_router_dispatch:
                 log_event(
@@ -638,7 +779,15 @@ class RoutingEngine:
             )
             return out
 
-        winner, results = await self._fallback_chain(capability, candidates, payload)
+        winner, results = await self._fallback_chain(
+            capability,
+            candidates,
+            payload,
+            timeout_sec=options.timeout_sec,
+            max_attempts=max(int(options.max_attempts or 0), int(self.settings.router.fallback_max_attempts)),
+            mode=options.mode,
+        )
+        failure_meta = self._summarize_failure(results) if winner is None else {}
         out = {
             "ok": winner is not None,
             "strategy": "fallback_chain",
@@ -647,6 +796,9 @@ class RoutingEngine:
             "latency_ms": round((time.monotonic() - started) * 1000.0, 2),
             "winner": winner.__dict__ if winner else None,
             "results": [r.__dict__ for r in results],
+            "status_code": int((winner.status_code if winner else failure_meta.get("status_code", 502))),
+            "error_type": str(failure_meta.get("error_type", "")) if winner is None else "",
+            "all_rate_limited": bool(failure_meta.get("all_rate_limited", False)) if winner is None else False,
         }
         if self.settings.logging.enabled and self.settings.logging.log_router_dispatch:
             log_event(
