@@ -7,6 +7,12 @@ def test_normalize_models_gemini_and_groq_and_pollinations():
     gemini_payload = {
         "models": [
             {
+                "name": "models/gemini-2.0-flash",
+                "display_name": "Gemini 2.0 Flash",
+                "supported_generation_methods": ["generateContent"],
+                "is_preview": False,
+            },
+            {
                 "name": "models/gemma-4-27b-it",
                 "display_name": "Gemma 4",
                 "supported_generation_methods": ["generateContent"],
@@ -38,6 +44,10 @@ def test_normalize_models_gemini_and_groq_and_pollinations():
 
     assert any("chat.completions" in item["capabilities"] for item in gm)
     assert any("embeddings" in item["capabilities"] for item in gm)
+    gemini_vision = next(item for item in gm if item["id"] == "gemini-2.0-flash")
+    gemma_row = next(item for item in gm if item["id"] == "gemma-4-27b-it")
+    assert "image" in gemini_vision["input_modalities"]
+    assert "image" not in gemma_row["input_modalities"]
     assert any("audio.transcriptions" in item["capabilities"] for item in gr)
     assert any(item["paid_only"] is True for item in pl)
 
