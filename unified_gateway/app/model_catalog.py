@@ -51,6 +51,27 @@ def _capabilities_from_gemini_methods(methods: Iterable[str]) -> List[str]:
     return sorted(set(out))
 
 
+def _gemini_supports_image_input(model_id: str, row: Dict[str, Any]) -> bool:
+    explicit_modalities = row.get("input_modalities")
+    if isinstance(explicit_modalities, list):
+        normalized = {str(v).strip().lower() for v in explicit_modalities if str(v).strip()}
+        if "image" in normalized:
+            return True
+
+    mid = model_id.lower()
+    if mid.startswith("gemma-"):
+        return False
+    if "embedding" in mid:
+        return False
+    if "imagen" in mid:
+        return False
+    if mid.startswith("gemini-2.") or mid.startswith("gemini-1.5-"):
+        return True
+    if "vision" in mid:
+        return True
+    return False
+
+
 def _capabilities_from_groq_model_id(model_id: str) -> List[str]:
     lid = model_id.lower()
     if "whisper" in lid:
@@ -119,6 +140,8 @@ def _normalize_gemini_models(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         model_id = _normalize_provider_model_id("gemini", raw_name)
         caps = _capabilities_from_gemini_methods(row.get("supported_generation_methods") or [])
         in_mod, out_mod = _modalities_from_capabilities(caps)
+        if _gemini_supports_image_input(model_id, row) and "chat.completions" in caps:
+            in_mod = sorted(set(in_mod + ["image"]))
         out.append(
             {
                 "provider": "gemini",
