@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UAG Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/studio/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js" defer></script>
+  <script src="/studio/app.js" defer></script>
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="bg-glow glow-a"></div>
+  <div class="bg-glow glow-b"></div>
+
+  <main class="shell">
+    <aside class="sidebar glass">
+      <div class="brand">
+        <div class="brand-mark">S</div>
+        <div>
+          <h1>UAG Studio</h1>
+          <p>Unified AI Testing Workbench</p>
+        </div>
+      </div>
+
+      <section class="panel stack gap-sm">
+        <h3>Connection</h3>
+        <label>API Token
+          <input id="tokenInput" type="password" autocomplete="off" placeholder="ajilAJIL" />
+        </label>
+        <label>Token Header
+          <input id="tokenHeaderInput" type="text" value="x-api-token" autocomplete="off" />
+        </label>
+        <div class="row">
+          <button id="saveSettingsBtn" class="btn">Save</button>
+          <button id="loadModelsBtn" class="btn btn-ghost">Load Models</button>
+        </div>
+        <div id="connStatus" class="hint">Ready</div>
+      </section>
+
+      <section class="panel stack gap-sm">
+        <h3>Router Defaults</h3>
+        <label>Strategy
+          <select id="routerStrategy">
+            <option value="fallback_chain">fallback_chain</option>
+            <option value="parallel_race">parallel_race</option>
+            <option value="aggregate">aggregate</option>
+          </select>
+        </label>
+        <label>Mode
+          <select id="routerMode">
+            <option value="limit_safe">limit_safe</option>
+            <option value="latency_first">latency_first</option>
+            <option value="quality_first">quality_first</option>
+          </select>
+        </label>
+        <div class="row two">
+          <label>Timeout (s)
+            <input id="routerTimeout" type="number" min="3" step="1" value="25" />
+          </label>
+          <label>Max Attempts
+            <input id="routerAttempts" type="number" min="1" step="1" value="6" />
+          </label>
+        </div>
+      </section>
+
+      <nav id="navTabs" class="tabs"></nav>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar glass">
+        <div>
+          <h2 id="viewTitle">Chat</h2>
+          <p id="viewDesc">Test every AI capability through a clean UI.</p>
+        </div>
+        <div class="meta">
+          <span id="modelCountBadge" class="badge">0 models</span>
+          <span id="providerCountBadge" class="badge">0 providers</span>
+        </div>
+      </header>
+
+      <section id="view-chat" class="view"></section>
+      <section id="view-vision" class="view hidden"></section>
+      <section id="view-responses" class="view hidden"></section>
+      <section id="view-image" class="view hidden"></section>
+      <section id="view-tts" class="view hidden"></section>
+      <section id="view-stt" class="view hidden"></section>
+      <section id="view-embeddings" class="view hidden"></section>
+      <section id="view-orchestrate" class="view hidden"></section>
+      <section id="view-models" class="view hidden"></section>
+    </section>
+  </main>
+
+  <template id="sharedConsoleTpl">
+    <div class="grid cols-2 gap-md">
+      <section class="card">
+        <h4>Request</h4>
+        <pre class="code" data-role="request"></pre>
+      </section>
+      <section class="card">
+        <h4>Response</h4>
+        <pre class="code" data-role="response"></pre>
+      </section>
+    </div>
+  </template>
+
+  <div id="toastRoot" class="toast-root"></div>
+</body>
+</html>
