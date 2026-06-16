@@ -18,7 +18,7 @@ services:
     container_name: uag-proxy2080
     restart: unless-stopped
     ports:
-      - "2080:3128"
+      - "2080:2080"
     profiles: ["proxy"]
 
   gateway:
@@ -42,7 +42,7 @@ services:
       # Ensure Redis works in-compose even if .env has localhost.
       UAG_REDIS_URL: ${UAG_REDIS_URL_DOCKER:-redis://redis:6379/0}
       # When proxy mode is enabled in .env, default to in-network proxy endpoint.
-      UAG_PROXY_URL: ${UAG_PROXY_URL_DOCKER:-http://proxy2080:3128}
+      UAG_PROXY_URL: ${UAG_PROXY_URL_DOCKER:-http://proxy2080:2080}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

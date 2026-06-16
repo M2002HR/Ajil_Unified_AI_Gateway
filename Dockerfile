@@ -17,10 +17,10 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 RUN set -eux; \
     if [ -n "${PIP_INDEX_URL}" ]; then pip config set global.index-url "${PIP_INDEX_URL}"; fi; \
     if [ -n "${PIP_EXTRA_INDEX_URL}" ]; then pip config set global.extra-index-url "${PIP_EXTRA_INDEX_URL}"; fi; \
-    HTTP_PROXY="${HTTP_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}" ALL_PROXY="${ALL_PROXY}" NO_PROXY="${NO_PROXY}" \
-    pip install --upgrade --no-cache-dir pip setuptools wheel; \
-    HTTP_PROXY="${HTTP_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}" ALL_PROXY="${ALL_PROXY}" NO_PROXY="${NO_PROXY}" \
-    pip install --no-cache-dir -r /app/unified_gateway/requirements.txt
+     \
+    pip install --no-cache-dir --retries 20 --upgrade pip setuptools wheel; \
+     \
+    pip install --no-cache-dir --retries 20 -r /app/unified_gateway/requirements.txt
 
 COPY . /app
 

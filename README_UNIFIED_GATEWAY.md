@@ -66,7 +66,7 @@ UAG_PROXY_URL=socks5://127.0.0.1:2080
 ```
 
 In Docker Compose, gateway uses:
-- `UAG_PROXY_URL_DOCKER` (default `http://proxy2080:3128`)
+- `UAG_PROXY_URL_DOCKER` (default `http://proxy2080:2080`)
 
 ## Usage Telemetry Buffer
 
