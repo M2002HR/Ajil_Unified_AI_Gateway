@@ -3,6 +3,9 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY unified_gateway/requirements.txt /app/unified_gateway/requirements.txt
 
+# Prefer IPv4 during builds to avoid hanging package installs on broken IPv6 paths.
+RUN printf 'precedence ::ffff:0:0/96  100\n' >> /etc/gai.conf
+
 # Optional build-time networking/proxy/index settings (passed via docker-compose build args).
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
