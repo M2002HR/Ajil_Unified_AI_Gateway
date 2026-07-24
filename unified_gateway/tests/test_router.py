@@ -321,6 +321,34 @@ async def test_failure_summary_all_429_is_reported_as_all_rate_limited():
 
 
 @pytest.mark.asyncio
+async def test_structured_output_never_uses_prose_local_fallback() -> None:
+    settings = Settings()
+    guard = RateLimitGuard(redis_url="redis://127.0.0.1:6379/9", key_prefix="test", required=False)
+    registry = FakeRegistry()
+    registry.groq.ok = False
+    registry.gemini.ok = False
+    engine = RoutingEngine(settings, registry, guard)
+
+    result = await engine.dispatch(
+        "chat.completions",
+        {
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "response_format": {"type": "json_object"},
+        },
+        RouterOptions(
+            providers=["groq", "gemini"],
+            strategy="fallback_chain",
+            max_attempts=2,
+        ),
+    )
+
+    assert result["ok"] is False
+    assert result["winner"] is None
+    assert all(item["provider"] != "local-fallback" for item in result["results"])
+    await guard.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_rescue_fallback_succeeds_even_if_primary_provider_fails():
     settings = Settings()
     guard = RateLimitGuard(redis_url="redis://127.0.0.1:6379/9", key_prefix="test", required=False)

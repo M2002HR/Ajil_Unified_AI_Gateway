@@ -204,6 +204,15 @@ class RoutingEngine:
         return True
 
     @staticmethod
+    def _requires_structured_output(payload: Dict[str, Any]) -> bool:
+        """A prose fallback is unsafe when a caller explicitly requested JSON."""
+        response_format = payload.get("response_format")
+        if not isinstance(response_format, dict):
+            return False
+        kind = str(response_format.get("type") or "").strip().lower()
+        return kind in {"json_object", "json_schema"}
+
+    @staticmethod
     def _candidate_supports_capability(capability: str, candidate: Candidate) -> bool:
         model = str(candidate.model or "").strip().lower()
         provider = str(candidate.provider or "").strip().lower()
@@ -1151,7 +1160,11 @@ class RoutingEngine:
                 if rescue_winner is not None:
                     winner = rescue_winner
         failure_meta = self._summarize_failure(results) if winner is None else {}
-        if winner is None and self._should_local_fallback(capability, failure_meta):
+        if (
+            winner is None
+            and not self._requires_structured_output(payload)
+            and self._should_local_fallback(capability, failure_meta)
+        ):
             fallback_result = self._build_local_fallback_result(
                 capability,
                 payload,
